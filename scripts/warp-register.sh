@@ -5,11 +5,13 @@
 # Usage: ./warp-register.sh > warp.conf
 #        ./warp-register.sh -v > warp.conf  # verbose mode
 #        ./warp-register.sh --qr            # display QR code in terminal
+#        ./warp-register.sh --key KEY       # register with a WARP+ license key
 #
 # Options:
 #   -v, --verbose     Print verbose output including API response to stderr
 #   -q, --qr          Display QR code in terminal (requires qrencode)
 #   -i, --info        Display account info to stderr
+#   -k, --key KEY     WARP+ license key to attach to the new device (optional)
 #
 # Environment variables (with defaults):
 #   WARP_DNS          - DNS servers (default: "1.1.1.1, 1.0.0.1")
@@ -20,6 +22,7 @@
 #   WARP_DEVICE_TYPE  - Device type for registration (default: "Linux")
 #   WARP_LOCALE       - Locale for registration (default: "en_US")
 #   WARP_TOS_DATE     - Terms of service date (default: current date)
+#   WARP_LICENSE_KEY  - WARP+ license key (default: empty, free account)
 
 set -euo pipefail
 
@@ -44,8 +47,16 @@ parse_args() {
                 SHOW_INFO=true
                 shift
                 ;;
+            -k|--key)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "Error: $1 requires a license key argument" >&2
+                    exit 1
+                fi
+                WARP_LICENSE_KEY="$2"
+                shift 2
+                ;;
             -h|--help)
-                head -n 22 "$0" | tail -n +2 | sed 's/^# \?//'
+                awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
                 exit 0
                 ;;
             *)
@@ -73,6 +84,7 @@ log_verbose() {
 : "${WARP_DEVICE_TYPE:=Linux}"
 : "${WARP_LOCALE:=en_US}"
 : "${WARP_TOS_DATE:=$(date -u +"%Y-%m-%dT%H:%M:%S.000+00:00")}"
+: "${WARP_LICENSE_KEY:=}"
 
 # API endpoint
 WARP_API_URL="https://api.cloudflareclient.com/v0a737/reg"
@@ -159,6 +171,68 @@ EOF
         echo "Error: Invalid response from WARP API - missing interface addresses" >&2
         echo "Response: $WARP_RESPONSE" >&2
         exit 1
+    fi
+}
+
+# Attach a WARP+ license key to the registered device
+apply_license_key() {
+    local device_id device_token payload response
+
+    device_id=$(echo "$WARP_RESPONSE" | jq -r '.id // empty')
+    device_token=$(echo "$WARP_RESPONSE" | jq -r '.token // empty')
+
+    if [[ -z "$device_id" || -z "$device_token" ]]; then
+        echo "Error: Registration response is missing the device id/token needed to apply a license key" >&2
+        exit 1
+    fi
+
+    payload=$(jq -n --arg license "$WARP_LICENSE_KEY" '{license: $license}')
+
+    response=$(curl -sS -X PUT \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $device_token" \
+        -d "$payload" \
+        "$WARP_API_URL/$device_id/account") || {
+        echo "Error: Failed to send the WARP+ license key to the API" >&2
+        exit 1
+    }
+
+    log_verbose "License update response:"
+    if [[ "$VERBOSE" == true ]]; then
+        echo "$response" | jq . >&2 || echo "$response" >&2
+    fi
+
+    if ! echo "$response" | jq -e . &>/dev/null; then
+        echo "Error: Unexpected response while applying the WARP+ license key" >&2
+        echo "Response: $response" >&2
+        exit 1
+    fi
+
+    # note: jq's // operator treats false as empty, so test the field explicitly
+    if echo "$response" | jq -e '.success == false' &>/dev/null; then
+        echo "Error: WARP+ license key rejected: $(echo "$response" | jq -r '.errors[0].message // "unknown error"')" >&2
+        exit 1
+    fi
+
+    # Re-read the device so the config and account info reflect the licensed account
+    response=$(curl -sS \
+        -H "Authorization: Bearer $device_token" \
+        "$WARP_API_URL/$device_id") || {
+        echo "Error: Failed to re-read the device after applying the license key" >&2
+        exit 1
+    }
+
+    if ! echo "$response" | jq -e '.config.interface.addresses' &>/dev/null; then
+        echo "Error: Invalid response when re-reading the licensed device" >&2
+        echo "Response: $response" >&2
+        exit 1
+    fi
+
+    WARP_RESPONSE="$response"
+
+    log_verbose "Licensed device response:"
+    if [[ "$VERBOSE" == true ]]; then
+        echo "$WARP_RESPONSE" | jq . >&2
     fi
 }
 
@@ -274,6 +348,11 @@ main() {
 
     echo "Registering with Cloudflare WARP..." >&2
     register_with_warp
+
+    if [[ -n "$WARP_LICENSE_KEY" ]]; then
+        echo "Applying WARP+ license key..." >&2
+        apply_license_key
+    fi
 
     echo "Parsing response..." >&2
     parse_warp_response

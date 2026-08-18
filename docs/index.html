@@ -113,6 +113,12 @@
             <p>Generate a WireGuard configuration for Cloudflare WARP. All processing happens in your browser.</p>
         </header>
 
+        <label for="licenseKey">
+            WARP+ License Key <small>(optional)</small>
+            <input type="text" id="licenseKey" placeholder="xxxxxxxx-xxxxxxxx-xxxxxxxx" autocomplete="off" spellcheck="false">
+            <small>Leave empty to generate a free WARP account.</small>
+        </label>
+
         <button id="generateBtn">Generate WARP Config</button>
 
         <details>
@@ -192,9 +198,10 @@
     <script>
         //const CORS_PROXY = 'https://corsproxy.io/?';
         const CORS_PROXY = 'https://proxy.corsfix.com/?';
-        const WARP_API = 'https://api.cloudflareclient.com/v0a737/reg';
+        const WARP_API = 'https://api.cloudflareclient.com/v0a737';
 
         const generateBtn = document.getElementById('generateBtn');
+        const licenseKeyInput = document.getElementById('licenseKey');
         const copyBtn = document.getElementById('copyBtn');
         const downloadBtn = document.getElementById('downloadBtn');
         const configOutput = document.getElementById('configOutput');
@@ -258,6 +265,27 @@
             }
         }
 
+        async function warpRequest(path, { method = 'GET', token, body } = {}) {
+            const headers = {};
+            if (body) headers['Content-Type'] = 'application/json';
+            if (token) headers['Authorization'] = `Bearer ${token}`;
+
+            const response = await fetch(CORS_PROXY + WARP_API + path, {
+                method,
+                headers,
+                body: body ? JSON.stringify(body) : undefined
+            });
+
+            const data = await response.json();
+
+            if (!response.ok || data.success === false) {
+                const errorMsg = data.errors?.[0]?.message || data.error?.message || 'Unknown error';
+                throw new Error(errorMsg);
+            }
+
+            return data;
+        }
+
         async function registerWithWarp(publicKey, options) {
             const payload = {
                 key: publicKey,
@@ -268,22 +296,33 @@
                 locale: options.locale
             };
 
-            const response = await fetch(CORS_PROXY + WARP_API, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(payload)
-            });
+            try {
+                return await warpRequest('/reg', { method: 'POST', body: payload });
+            } catch (err) {
+                throw new Error(`API Error: ${err.message}`);
+            }
+        }
 
-            const data = await response.json();
-
-            if (!response.ok || data.success === false) {
-                const errorMsg = data.errors?.[0]?.message || data.error?.message || 'Unknown error';
-                throw new Error(`API Error: ${errorMsg}`);
+        async function applyLicense(device, license) {
+            let account;
+            try {
+                account = await warpRequest(`/reg/${device.id}/account`, {
+                    method: 'PUT',
+                    token: device.token,
+                    body: { license }
+                });
+            } catch (err) {
+                throw new Error(`License activation failed: ${err.message}`);
             }
 
-            return data;
+            try {
+                // re-read the device so the config and account info reflect the licensed account
+                const refreshed = await warpRequest(`/reg/${device.id}`, { token: device.token });
+                return { ...device, ...refreshed };
+            } catch (err) {
+                // the license is bound; fall back to the account returned by the update
+                return { ...device, account: { ...device.account, ...account, license } };
+            }
         }
 
         function generateConfig(privateKey, warpResponse, options) {
@@ -318,9 +357,15 @@ Endpoint = ${peer.endpoint.host}`;
                 // Generate WireGuard keypair
                 const keypair = window.wireguard.generateKeypair();
                 const options = getOptions();
+                const license = licenseKeyInput.value.trim();
 
                 // Register with Cloudflare WARP
-                const warpResponse = await registerWithWarp(keypair.publicKey, options);
+                let warpResponse = await registerWithWarp(keypair.publicKey, options);
+
+                // Attach the WARP+ license to the new device, if one was provided
+                if (license) {
+                    warpResponse = await applyLicense(warpResponse, license);
+                }
 
                 // Generate config
                 const config = generateConfig(keypair.privateKey, warpResponse, options);
