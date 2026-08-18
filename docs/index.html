@@ -80,6 +80,18 @@
         .account-info dd {
             margin: 0;
         }
+        #optionsForm > small {
+            display: block;
+            margin-bottom: 1rem;
+        }
+        #formatToggle {
+            margin-bottom: 1rem;
+        }
+        /* Pico's group styling overrides the .outline class, so drive the state from aria-pressed */
+        #formatToggle button[aria-pressed="false"] {
+            background-color: transparent;
+            color: var(--pico-primary);
+        }
         .qr-section {
             text-align: center;
             margin: 1rem 0;
@@ -138,8 +150,13 @@
                 </label>
                 <label>
                     Persistent Keepalive (0 = disabled)
-                    <input type="number" name="keepalive" value="0" min="0">
+                    <input type="number" name="keepalive" value="25" min="0">
                 </label>
+                <label>
+                    <input type="checkbox" name="ipEndpoint" role="switch">
+                    Use endpoint IP instead of hostname
+                </label>
+                <small>Keeps a stalled tunnel from having to re-resolve DNS through itself.</small>
                 <label>
                     Device Type
                     <input type="text" name="deviceType" value="Linux">
@@ -163,6 +180,8 @@
                     <dd id="deviceId">-</dd>
                     <dt>Account Type</dt>
                     <dd id="accountType">-</dd>
+                    <dt>Client ID</dt>
+                    <dd id="clientId">-</dd>
                     <dt>License</dt>
                     <dd id="license">-</dd>
                     <dt>Created</dt>
@@ -172,13 +191,18 @@
                 </dl>
             </div>
 
+            <div role="group" id="formatToggle">
+                <button type="button" data-format="wireguard" aria-pressed="true">WireGuard (.conf)</button>
+                <button type="button" data-format="stash" aria-pressed="false">Stash / Clash (YAML)</button>
+            </div>
+
             <div class="qr-section">
                 <div id="qrCode"></div>
-                <p class="qr-label">Scan with WireGuard mobile app</p>
+                <p class="qr-label" id="qrLabel">Scan with WireGuard mobile app</p>
             </div>
 
             <label>
-                WireGuard Configuration
+                <span id="configLabel">WireGuard Configuration</span>
                 <textarea id="configOutput" class="config-output" readonly></textarea>
             </label>
             <div class="button-group">
@@ -209,6 +233,13 @@
         const errorDiv = document.getElementById('error');
         const optionsForm = document.getElementById('optionsForm');
         const qrCodeDiv = document.getElementById('qrCode');
+        const qrLabel = document.getElementById('qrLabel');
+        const configLabel = document.getElementById('configLabel');
+        const formatToggle = document.getElementById('formatToggle');
+
+        // Set by the generate button, then re-rendered whenever the output format changes.
+        let device = null;
+        let outputFormat = 'wireguard';
 
         function showError(message) {
             errorDiv.textContent = message;
@@ -226,6 +257,7 @@
                 mtu: formData.get('mtu'),
                 allowedIps: formData.get('allowedIps'),
                 keepalive: formData.get('keepalive'),
+                ipEndpoint: formData.get('ipEndpoint') !== null,
                 deviceType: formData.get('deviceType'),
                 locale: formData.get('locale')
             };
@@ -246,18 +278,40 @@
             document.getElementById('accountType').textContent =
                 (warpResponse.account?.warp_plus ? 'WARP+ ' : '') +
                 (warpResponse.account?.account_type || 'free');
+            const reserved = reservedBytes(warpResponse);
+            document.getElementById('clientId').textContent = warpResponse.config?.client_id
+                ? `${warpResponse.config.client_id} → reserved = [${reserved.join(', ')}]`
+                : '-';
             document.getElementById('license').textContent = warpResponse.account?.license || '-';
             document.getElementById('created').textContent = formatDate(warpResponse.created);
             document.getElementById('expires').textContent = formatDate(warpResponse.account?.ttl);
         }
 
-        async function generateQRCode(config) {
+        // Cloudflare puts a 24-bit client id in WireGuard's three reserved header bytes and
+        // routes packets by hashing it, so a tunnel that omits it loses its server affinity.
+        function reservedBytes(warpResponse) {
+            const clientId = warpResponse.config?.client_id;
+            if (!clientId) return [0, 0, 0];
+            return Array.from(atob(clientId), char => char.charCodeAt(0) & 0xff);
+        }
+
+        function endpointParts(warpResponse) {
+            const endpoint = warpResponse.config.peers[0].endpoint;
+            const port = (endpoint.host || '').split(':').pop() || '2408';
+            return { ip: (endpoint.v4 || '').split(':')[0], port };
+        }
+
+        function base64(text) {
+            return btoa(String.fromCharCode(...new TextEncoder().encode(text)));
+        }
+
+        async function generateQRCode(payload, options = {}) {
             qrCodeDiv.innerHTML = '';
             try {
-                await QRCode.toCanvas(qrCodeDiv.appendChild(document.createElement('canvas')), config, {
-                    width: 256,
+                await QRCode.toCanvas(qrCodeDiv.appendChild(document.createElement('canvas')), payload, {
+                    width: options.width || 256,
                     margin: 0,
-                    errorCorrectionLevel: 'M'
+                    errorCorrectionLevel: options.errorCorrectionLevel || 'M'
                 });
             } catch (err) {
                 console.error('QR code generation failed:', err);
@@ -338,8 +392,11 @@
         function generateConfig(privateKey, warpResponse, options) {
             const peer = warpResponse.config.peers[0];
             const iface = warpResponse.config.interface;
+            const { ip, port } = endpointParts(warpResponse);
+            const endpoint = options.ipEndpoint ? `${ip}:${port}` : peer.endpoint.host;
 
-            let config = `[Interface]
+            let config = `# ClientID = ${warpResponse.config.client_id} (reserved = [${reservedBytes(warpResponse).join(', ')}])
+[Interface]
 PrivateKey = ${privateKey}
 Address = ${iface.addresses.v4}/32, ${iface.addresses.v6}/128
 DNS = ${options.dns}
@@ -348,13 +405,98 @@ MTU = ${options.mtu}
 [Peer]
 PublicKey = ${peer.public_key}
 AllowedIPs = ${options.allowedIps}
-Endpoint = ${peer.endpoint.host}`;
+Endpoint = ${endpoint}`;
 
             if (options.keepalive && options.keepalive !== '0') {
                 config += `\nPersistentKeepalive = ${options.keepalive}`;
             }
 
             return config;
+        }
+
+        // Stash and other userspace clients can send the reserved bytes, which the official
+        // WireGuard apps cannot, so this profile is the stable way to use WARP as a proxy.
+        function generateStashConfig(privateKey, warpResponse, options) {
+            const peer = warpResponse.config.peers[0];
+            const iface = warpResponse.config.interface;
+            const { ip, port } = endpointParts(warpResponse);
+            const dns = options.dns.split(',').map(entry => entry.trim()).filter(Boolean);
+            const keepalive = options.keepalive && options.keepalive !== '0'
+                ? [`    keepalive: ${options.keepalive}`]
+                : [];
+
+            const proxy = [
+                `  - name: WARP`,
+                `    type: wireguard`,
+                `    server: ${ip}`,
+                `    port: ${port}`,
+                `    private-key: ${privateKey}`,
+                `    public-key: ${peer.public_key}`,
+                `    ip: ${iface.addresses.v4}`,
+                `    ipv6: ${iface.addresses.v6}`,
+                `    reserved: [${reservedBytes(warpResponse).join(', ')}]`,
+                ...keepalive,
+                `    mtu: ${options.mtu}`,
+                `    udp: true`,
+                `    dns:`,
+                ...dns.map(entry => `      - ${entry}`)
+            ];
+
+            return `# Cloudflare WARP profile for Stash / Clash.
+# reserved carries Cloudflare's client_id: without it WARP cannot keep routing
+# your packets to the same server and the tunnel stalls after a while.
+# To chain WARP behind another proxy, uncomment dialer-proxy below.
+# On mihomo / Clash.Meta, rename keepalive to persistent-keepalive.
+mixed-port: 7890
+mode: rule
+proxies:
+${proxy.join('\n')}
+    # dialer-proxy: My Other Proxy
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - WARP
+      - DIRECT
+rules:
+  - MATCH,PROXY
+`;
+        }
+
+        function outputs() {
+            const { privateKey, warpResponse, options } = device;
+            if (outputFormat === 'stash') {
+                const config = generateStashConfig(privateKey, warpResponse, options);
+                const dataUrl = `data:text/yaml;base64,${base64(config)}`;
+                return {
+                    config,
+                    filename: 'warp.yaml',
+                    mime: 'text/yaml',
+                    label: 'Stash / Clash Profile',
+                    qr: `stash://install-config?url=${encodeURIComponent(dataUrl)}`,
+                    qrOptions: { width: 320, errorCorrectionLevel: 'L' },
+                    qrLabel: 'Scan in Stash: Settings → Profiles → Scan QRcode. If Stash rejects it, download the YAML and open it with Stash instead.'
+                };
+            }
+            const config = generateConfig(privateKey, warpResponse, options);
+            return {
+                config,
+                filename: 'warp.conf',
+                mime: 'text/plain',
+                label: 'WireGuard Configuration',
+                qr: config,
+                qrOptions: {},
+                qrLabel: 'Scan with WireGuard mobile app'
+            };
+        }
+
+        async function renderOutput() {
+            const output = outputs();
+            configOutput.value = output.config;
+            configLabel.textContent = output.label;
+            qrLabel.textContent = output.qrLabel;
+            downloadBtn.textContent = `Download ${output.filename}`;
+            await generateQRCode(output.qr, output.qrOptions);
         }
 
         generateBtn.addEventListener('click', async () => {
@@ -378,16 +520,12 @@ Endpoint = ${peer.endpoint.host}`;
                 }
 
                 // Generate config
-                const config = generateConfig(keypair.privateKey, warpResponse, options);
+                device = { privateKey: keypair.privateKey, warpResponse, options };
 
                 // Display account info
                 displayAccountInfo(warpResponse);
 
-                // Generate QR code
-                await generateQRCode(config);
-
-                // Display config
-                configOutput.value = config;
+                await renderOutput();
                 outputSection.classList.remove('hidden');
             } catch (err) {
                 showError(err.message);
@@ -411,12 +549,25 @@ Endpoint = ${peer.endpoint.host}`;
             }
         });
 
+        formatToggle.addEventListener('click', async (event) => {
+            const button = event.target.closest('button[data-format]');
+            if (!button || button.dataset.format === outputFormat) return;
+
+            outputFormat = button.dataset.format;
+            for (const option of formatToggle.querySelectorAll('button[data-format]')) {
+                option.setAttribute('aria-pressed', String(option.dataset.format === outputFormat));
+            }
+
+            if (device) await renderOutput();
+        });
+
         downloadBtn.addEventListener('click', () => {
-            const blob = new Blob([configOutput.value], { type: 'text/plain' });
+            const { filename, mime } = outputs();
+            const blob = new Blob([configOutput.value], { type: mime });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = 'warp.conf';
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
