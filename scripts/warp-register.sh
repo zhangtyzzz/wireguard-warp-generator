@@ -18,7 +18,7 @@
 #   WARP_MTU          - Interface MTU (default: 1280)
 #   WARP_ALLOWED_IPS  - Allowed IPs (default: "0.0.0.0/0, ::/0")
 #   WARP_LISTEN_PORT  - Listen port (default: 0, omitted from config)
-#   WARP_PERSISTENT_KEEPALIVE - Persistent keepalive in seconds (default: 0, omitted from config)
+#   WARP_PERSISTENT_KEEPALIVE - Persistent keepalive in seconds (default: 25, 0 to omit)
 #   WARP_DEVICE_TYPE  - Device type for registration (default: "Linux")
 #   WARP_LOCALE       - Locale for registration (default: "en_US")
 #   WARP_TOS_DATE     - Terms of service date (default: current date)
@@ -80,7 +80,7 @@ log_verbose() {
 : "${WARP_MTU:=1280}"
 : "${WARP_ALLOWED_IPS:=0.0.0.0/0, ::/0}"
 : "${WARP_LISTEN_PORT:=0}"
-: "${WARP_PERSISTENT_KEEPALIVE:=0}"
+: "${WARP_PERSISTENT_KEEPALIVE:=25}"
 : "${WARP_DEVICE_TYPE:=Linux}"
 : "${WARP_LOCALE:=en_US}"
 : "${WARP_TOS_DATE:=$(date -u +"%Y-%m-%dT%H:%M:%S.000+00:00")}"
@@ -250,6 +250,12 @@ parse_warp_response() {
     INTERFACE_IPV6=$(echo "$WARP_RESPONSE" | jq -r '.config.interface.addresses.v6')
     log_verbose "Interface IPv6: $INTERFACE_IPV6"
 
+    # Cloudflare identifies the device by a 24-bit client id carried in WireGuard's three
+    # reserved header bytes, which userspace clients (Stash, mihomo, sing-box, Xray) can send
+    CLIENT_ID=$(echo "$WARP_RESPONSE" | jq -r '.config.client_id // empty')
+    RESERVED=$(printf '%s' "$CLIENT_ID" | base64 -d 2>/dev/null | od -An -tu1 | tr -s ' ' | sed 's/^ //; s/ $//; s/ /, /g') || true
+    log_verbose "Client ID: $CLIENT_ID (reserved = [$RESERVED])"
+
     # Log the full endpoint object for debugging
     log_verbose "Endpoint object from response:"
     if [[ "$VERBOSE" == true ]]; then
@@ -284,6 +290,7 @@ display_account_info() {
     echo "Account ID:   $(echo "$WARP_RESPONSE" | jq -r '.account.id // "-"')" >&2
     echo "Device ID:    $(echo "$WARP_RESPONSE" | jq -r '.id // "-"')" >&2
     echo "Account Type: $(echo "$WARP_RESPONSE" | jq -r '(if .account.warp_plus then "WARP+ " else "" end) + (.account.account_type // "free")')" >&2
+    echo "Client ID:    $CLIENT_ID (reserved = [$RESERVED])" >&2
     echo "License:      $(echo "$WARP_RESPONSE" | jq -r '.account.license // "-"')" >&2
     echo "Created:      $(echo "$WARP_RESPONSE" | jq -r '.created // "-"')" >&2
     echo "Expires:      $(echo "$WARP_RESPONSE" | jq -r '.account.ttl // "-"')" >&2
@@ -312,6 +319,7 @@ generate_wireguard_config() {
     fi
 
     cat <<EOF
+# ClientID = $CLIENT_ID (reserved = [$RESERVED])
 [Interface]
 PrivateKey = $PRIVATE_KEY
 Address = $address
