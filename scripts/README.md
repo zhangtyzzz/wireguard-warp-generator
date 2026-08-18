@@ -24,6 +24,9 @@ Shell script to register with Cloudflare WARP and generate a WireGuard configura
 # Verbose mode (shows API response)
 ./warp-register.sh -v > warp.conf
 
+# With a WARP+ license key
+./warp-register.sh --key xxxxxxxx-xxxxxxxx-xxxxxxxx > warp.conf
+
 # Combined flags
 ./warp-register.sh --qr --info > warp.conf
 ```
@@ -35,6 +38,7 @@ Shell script to register with Cloudflare WARP and generate a WireGuard configura
 | `-v, --verbose` | Print verbose output including API response |
 | `-q, --qr` | Display QR code in terminal (requires `qrencode`) |
 | `-i, --info` | Display account info (ID, license, expiry) |
+| `-k, --key KEY` | WARP+ license key to attach to the new device (optional) |
 | `-h, --help` | Show help message |
 
 ## Environment Variables
@@ -49,6 +53,7 @@ Shell script to register with Cloudflare WARP and generate a WireGuard configura
 | `WARP_DEVICE_TYPE` | `Linux` | Device type for registration |
 | `WARP_LOCALE` | `en_US` | Locale |
 | `WARP_TOS_DATE` | Current date | Terms of service agreement date |
+| `WARP_LICENSE_KEY` | (empty) | WARP+ license key; empty registers a free account |
 
 ## Examples
 
@@ -61,6 +66,9 @@ WARP_ALLOWED_IPS="1.1.1.1/32, 1.0.0.1/32" ./warp-register.sh > warp.conf
 
 # With persistent keepalive (useful for NAT)
 WARP_PERSISTENT_KEEPALIVE=25 ./warp-register.sh > warp.conf
+
+# WARP+ license key via environment variable
+WARP_LICENSE_KEY="xxxxxxxx-xxxxxxxx-xxxxxxxx" ./warp-register.sh > warp.conf
 ```
 
 ## Connect
