@@ -6,7 +6,19 @@ Generate WireGuard configurations for Cloudflare WARP.
 
 **[https://lanrat.github.io/wireguard-warp-generator/](https://lanrat.github.io/wireguard-warp-generator/)**
 
-A browser-based tool that generates configs entirely client-side. Features QR code for mobile import and customizable options. Output either a WireGuard `.conf` or a Stash / Clash profile, which carries Cloudflare's `reserved` bytes so userspace clients keep a stable WARP session. An optional WARP+ license key field attaches your subscription to the generated device; leave it empty for a free account.
+A browser-based tool that generates configs entirely client-side. Pick a tunnel protocol and an output format:
+
+| Protocol | Output | Use |
+|----------|--------|-----|
+| WireGuard | `warp.conf` | Official WireGuard clients, with a QR code for mobile import |
+| WireGuard | `warp.yaml` | Standalone Clash / Stash profile, carrying the `reserved` bytes |
+| WireGuard | `warp.stoverride` | Adds the proxy to the profile Stash already has loaded |
+| MASQUE | `warp.yaml` / `warp.stoverride` | `type: masque` proxy on UDP 443, needs Stash 3.6+ / macOS 4.3+ |
+
+MASQUE is the protocol the official WARP client uses: CONNECT-IP over HTTP/3 on port 443, served
+from Cloudflare's `162.159.198.0/24` range rather than WireGuard's UDP 2408. An optional WARP+
+license key attaches your subscription to the generated device, and an optional device name is
+stored on it.
 
 ## Shell Script
 
@@ -21,13 +33,16 @@ Command-line tool for generating WARP configs. See [scripts/README.md](scripts/R
 
 # With a WARP+ license key
 ./scripts/warp-register.sh --key xxxxxxxx-xxxxxxxx-xxxxxxxx > warp.conf
+
+# With a device name
+./scripts/warp-register.sh --name my-laptop > warp.conf
 ```
 
 ## How It Works
 
 1. Generates a WireGuard keypair locally
 2. Registers the public key with Cloudflare's WARP API
-3. Attaches a WARP+ license key to the new device, if one was provided
+3. Names the device and attaches a WARP+ license key, if either was provided
 4. Outputs a complete WireGuard configuration
 
 ## Reserved Bytes
