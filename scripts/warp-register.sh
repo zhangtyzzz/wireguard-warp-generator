@@ -12,6 +12,7 @@
 #   -q, --qr          Display QR code in terminal (requires qrencode)
 #   -i, --info        Display account info to stderr
 #   -k, --key KEY     WARP+ license key to attach to the new device (optional)
+#   -n, --name NAME   Device name to store on the new device (optional)
 #
 # Environment variables (with defaults):
 #   WARP_DNS          - DNS servers (default: "1.1.1.1, 1.0.0.1")
@@ -23,6 +24,7 @@
 #   WARP_LOCALE       - Locale for registration (default: "en_US")
 #   WARP_TOS_DATE     - Terms of service date (default: current date)
 #   WARP_LICENSE_KEY  - WARP+ license key (default: empty, free account)
+#   WARP_NAME         - Device name stored on the new device (default: empty)
 
 set -euo pipefail
 
@@ -55,6 +57,14 @@ parse_args() {
                 WARP_LICENSE_KEY="$2"
                 shift 2
                 ;;
+            -n|--name)
+                if [[ $# -lt 2 || -z "$2" ]]; then
+                    echo "Error: $1 requires a device name argument" >&2
+                    exit 1
+                fi
+                WARP_NAME="$2"
+                shift 2
+                ;;
             -h|--help)
                 awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
                 exit 0
@@ -85,6 +95,7 @@ log_verbose() {
 : "${WARP_LOCALE:=en_US}"
 : "${WARP_TOS_DATE:=$(date -u +"%Y-%m-%dT%H:%M:%S.000+00:00")}"
 : "${WARP_LICENSE_KEY:=}"
+: "${WARP_NAME:=}"
 
 # API endpoint
 WARP_API_URL="https://api.cloudflareclient.com/v0a737/reg"
@@ -172,6 +183,37 @@ EOF
         echo "Response: $WARP_RESPONSE" >&2
         exit 1
     fi
+}
+
+# Store a device name on the registered device
+apply_device_name() {
+    local device_id device_token response
+
+    device_id=$(echo "$WARP_RESPONSE" | jq -r '.id // empty')
+    device_token=$(echo "$WARP_RESPONSE" | jq -r '.token // empty')
+
+    if [[ -z "$device_id" || -z "$device_token" ]]; then
+        echo "Error: Registration response is missing the device id/token needed to set a name" >&2
+        exit 1
+    fi
+
+    response=$(curl -sS -X PATCH \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $device_token" \
+        -d "$(jq -n --arg name "$WARP_NAME" '{name: $name}')" \
+        "$WARP_API_URL/$device_id") || {
+        echo "Error: Failed to set the device name" >&2
+        exit 1
+    }
+
+    if ! echo "$response" | jq -e '.config.interface.addresses' &>/dev/null; then
+        echo "Error: Unexpected response while setting the device name" >&2
+        echo "Response: $response" >&2
+        exit 1
+    fi
+
+    WARP_RESPONSE="$response"
+    log_verbose "Device name set to: $(echo "$WARP_RESPONSE" | jq -r '.name // "-"')"
 }
 
 # Attach a WARP+ license key to the registered device
@@ -289,6 +331,7 @@ display_account_info() {
     echo "=== Account Info ===" >&2
     echo "Account ID:   $(echo "$WARP_RESPONSE" | jq -r '.account.id // "-"')" >&2
     echo "Device ID:    $(echo "$WARP_RESPONSE" | jq -r '.id // "-"')" >&2
+    echo "Device Name:  $(echo "$WARP_RESPONSE" | jq -r 'if (.name // "") == "" then "(unnamed)" else .name end')" >&2
     echo "Account Type: $(echo "$WARP_RESPONSE" | jq -r '(if .account.warp_plus then "WARP+ " else "" end) + (.account.account_type // "free")')" >&2
     echo "Client ID:    $CLIENT_ID (reserved = [$RESERVED])" >&2
     echo "License:      $(echo "$WARP_RESPONSE" | jq -r '.account.license // "-"')" >&2
@@ -356,6 +399,11 @@ main() {
 
     echo "Registering with Cloudflare WARP..." >&2
     register_with_warp
+
+    if [[ -n "$WARP_NAME" ]]; then
+        echo "Setting device name..." >&2
+        apply_device_name
+    fi
 
     if [[ -n "$WARP_LICENSE_KEY" ]]; then
         echo "Applying WARP+ license key..." >&2

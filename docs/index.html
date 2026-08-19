@@ -80,6 +80,10 @@
         .account-info dd {
             margin: 0;
         }
+        #protocolChoice small {
+            display: block;
+            margin: 0 0 0.75rem 1.75rem;
+        }
         #optionsForm > small {
             display: block;
             margin-bottom: 1rem;
@@ -110,6 +114,15 @@
             color: var(--pico-muted-color);
             font-size: 0.875rem;
         }
+        .import-hint {
+            background-color: var(--pico-card-background-color);
+            border: 1px solid var(--pico-muted-border-color);
+            border-radius: var(--pico-border-radius);
+            padding: 0.75rem 1rem;
+            font-size: 0.875rem;
+            color: var(--pico-muted-color);
+            white-space: pre-line;
+        }
         footer {
             text-align: center;
             margin-top: 2rem;
@@ -130,6 +143,25 @@
             <input type="text" id="licenseKey" placeholder="xxxxxxxx-xxxxxxxx-xxxxxxxx" autocomplete="off" spellcheck="false">
             <small>Leave empty to generate a free WARP account.</small>
         </label>
+
+        <label for="deviceName">
+            Device Name <small>(optional)</small>
+            <input type="text" id="deviceName" placeholder="my-iphone" autocomplete="off" spellcheck="false">
+        </label>
+
+        <fieldset id="protocolChoice">
+            <legend>Tunnel protocol</legend>
+            <label>
+                <input type="radio" name="protocol" value="wireguard" checked>
+                WireGuard
+            </label>
+            <small>UDP 2408, works with every client.</small>
+            <label>
+                <input type="radio" name="protocol" value="masque">
+                MASQUE
+            </label>
+            <small>HTTP/3 over UDP 443, the protocol the official WARP client uses. Needs Stash 3.6+ / macOS 4.3+.</small>
+        </fieldset>
 
         <button id="generateBtn">Generate WARP Config</button>
 
@@ -178,6 +210,8 @@
                     <dd id="accountId">-</dd>
                     <dt>Device ID</dt>
                     <dd id="deviceId">-</dd>
+                    <dt>Device Name</dt>
+                    <dd id="deviceNameOut">-</dd>
                     <dt>Account Type</dt>
                     <dd id="accountType">-</dd>
                     <dt>Client ID</dt>
@@ -193,13 +227,16 @@
 
             <div role="group" id="formatToggle">
                 <button type="button" data-format="wireguard" aria-pressed="true">WireGuard (.conf)</button>
-                <button type="button" data-format="stash" aria-pressed="false">Stash / Clash (YAML)</button>
+                <button type="button" data-format="clash" aria-pressed="false">Clash / Stash profile</button>
+                <button type="button" data-format="override" aria-pressed="false">Stash override</button>
             </div>
 
-            <div class="qr-section">
+            <div class="qr-section" id="qrSection">
                 <div id="qrCode"></div>
                 <p class="qr-label" id="qrLabel">Scan with WireGuard mobile app</p>
             </div>
+
+            <p class="import-hint hidden" id="importHint"></p>
 
             <label>
                 <span id="configLabel">WireGuard Configuration</span>
@@ -223,9 +260,14 @@
         //const CORS_PROXY = 'https://corsproxy.io/?';
         const CORS_PROXY = 'https://proxy.corsfix.com/?';
         const WARP_API = 'https://api.cloudflareclient.com/v0a737';
+        // MASQUE device enrollment only exists on the newer API version the WARP app talks to
+        const MASQUE_API = 'https://api.cloudflareclient.com/v0a4471';
+        const MASQUE_CLIENT_VERSION = 'a-6.35-4471';
 
         const generateBtn = document.getElementById('generateBtn');
         const licenseKeyInput = document.getElementById('licenseKey');
+        const deviceNameInput = document.getElementById('deviceName');
+        const protocolChoice = document.getElementById('protocolChoice');
         const copyBtn = document.getElementById('copyBtn');
         const downloadBtn = document.getElementById('downloadBtn');
         const configOutput = document.getElementById('configOutput');
@@ -233,7 +275,9 @@
         const errorDiv = document.getElementById('error');
         const optionsForm = document.getElementById('optionsForm');
         const qrCodeDiv = document.getElementById('qrCode');
+        const qrSection = document.getElementById('qrSection');
         const qrLabel = document.getElementById('qrLabel');
+        const importHint = document.getElementById('importHint');
         const configLabel = document.getElementById('configLabel');
         const formatToggle = document.getElementById('formatToggle');
 
@@ -275,13 +319,16 @@
         function displayAccountInfo(warpResponse) {
             document.getElementById('accountId').textContent = warpResponse.account?.id || '-';
             document.getElementById('deviceId').textContent = warpResponse.id || '-';
+            document.getElementById('deviceNameOut').textContent = warpResponse.name || '(unnamed)';
             document.getElementById('accountType').textContent =
                 (warpResponse.account?.warp_plus ? 'WARP+ ' : '') +
                 (warpResponse.account?.account_type || 'free');
-            const reserved = reservedBytes(warpResponse);
-            document.getElementById('clientId').textContent = warpResponse.config?.client_id
-                ? `${warpResponse.config.client_id} → reserved = [${reserved.join(', ')}]`
-                : '-';
+            const clientId = warpResponse.config?.client_id;
+            document.getElementById('clientId').textContent = !clientId
+                ? '-'
+                : device?.protocol === 'masque'
+                    ? clientId
+                    : `${clientId} → reserved = [${reservedBytes(warpResponse).join(', ')}]`;
             document.getElementById('license').textContent = warpResponse.account?.license || '-';
             document.getElementById('created').textContent = formatDate(warpResponse.created);
             document.getElementById('expires').textContent = formatDate(warpResponse.account?.ttl);
@@ -301,8 +348,58 @@
             return { ip: (endpoint.v4 || '').split(':')[0], port };
         }
 
+        // The MASQUE endpoint lives on its own address range and the port only appears in
+        // the ports list, since endpoint.v4 comes back with a port of 0.
+        function masqueEndpointParts(warpResponse) {
+            const endpoint = warpResponse.config.peers[0].endpoint;
+            return {
+                ip: (endpoint.v4 || '').split(':')[0],
+                port: (endpoint.ports || [])[0] || 443
+            };
+        }
+
         function base64(text) {
             return btoa(String.fromCharCode(...new TextEncoder().encode(text)));
+        }
+
+        function base64Bytes(buffer) {
+            return btoa(String.fromCharCode(...new Uint8Array(buffer)));
+        }
+
+        function stripPem(key) {
+            return (key || '').replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+        }
+
+        function base64UrlBytes(value) {
+            const normalized = value.replace(/-/g, '+').replace(/_/g, '/');
+            return Uint8Array.from(atob(normalized), char => char.charCodeAt(0));
+        }
+
+        // Stash wants the P-256 private key as SEC1 DER. WebCrypto only exports PKCS#8, whose
+        // inner SEC1 omits the curve parameters, so rebuild the structure from the JWK scalars.
+        function buildSec1(d, x, y) {
+            const point = [0x04, ...x, ...y];
+            const body = [
+                0x02, 0x01, 0x01,
+                0x04, d.length, ...d,
+                // [0] parameters: OID 1.2.840.10045.3.1.7 (prime256v1)
+                0xa0, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+                // [1] publicKey BIT STRING
+                0xa1, point.length + 3, 0x03, point.length + 1, 0x00, ...point
+            ];
+            return new Uint8Array([0x30, body.length, ...body]);
+        }
+
+        async function generateP256Keypair() {
+            const keypair = await crypto.subtle.generateKey(
+                { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+            );
+            const [spki, jwk] = await Promise.all([
+                crypto.subtle.exportKey('spki', keypair.publicKey),
+                crypto.subtle.exportKey('jwk', keypair.privateKey)
+            ]);
+            const sec1 = buildSec1(base64UrlBytes(jwk.d), base64UrlBytes(jwk.x), base64UrlBytes(jwk.y));
+            return { publicKey: base64Bytes(spki), privateKey: base64Bytes(sec1) };
         }
 
         async function generateQRCode(payload, options = {}) {
@@ -319,12 +416,13 @@
             }
         }
 
-        async function warpRequest(path, { method = 'GET', token, body } = {}) {
+        async function warpRequest(path, { method = 'GET', token, body, api = WARP_API, clientVersion } = {}) {
             const headers = {};
             if (body) headers['Content-Type'] = 'application/json';
             if (token) headers['Authorization'] = `Bearer ${token}`;
+            if (clientVersion) headers['CF-Client-Version'] = clientVersion;
 
-            const response = await fetch(CORS_PROXY + WARP_API + path, {
+            const response = await fetch(CORS_PROXY + api + path, {
                 method,
                 headers,
                 body: body ? JSON.stringify(body) : undefined
@@ -367,13 +465,78 @@
             }
         }
 
-        async function applyLicense(device, license) {
+        async function setDeviceName(device, name, api = WARP_API) {
+            try {
+                return await warpRequest(`/reg/${device.id}`, {
+                    method: 'PATCH',
+                    token: device.token,
+                    body: { name },
+                    api
+                });
+            } catch (err) {
+                throw new Error(`Setting the device name failed: ${err.message}`);
+            }
+        }
+
+        // MASQUE needs a two step enrollment: the API only accepts a curve25519 key at
+        // registration, then the P-256 key is patched onto the device.
+        async function registerMasque(options, name) {
+            const throwaway = window.wireguard.generateKeypair();
+            const serial = Array.from(crypto.getRandomValues(new Uint8Array(8)))
+                .map(byte => byte.toString(16).padStart(2, '0').toUpperCase())
+                .join('');
+
+            let registration;
+            try {
+                registration = await warpRequest('/reg', {
+                    method: 'POST',
+                    api: MASQUE_API,
+                    clientVersion: MASQUE_CLIENT_VERSION,
+                    body: {
+                        key: throwaway.publicKey,
+                        install_id: '',
+                        fcm_token: '',
+                        tos: new Date().toISOString(),
+                        model: 'PC',
+                        serial_number: serial,
+                        os_version: '',
+                        key_type: 'curve25519',
+                        tunnel_type: 'wireguard',
+                        locale: options.locale
+                    }
+                });
+            } catch (err) {
+                throw new Error(`API Error: ${err.message}`);
+            }
+
+            const keypair = await generateP256Keypair();
+            const enrollment = { key: keypair.publicKey, key_type: 'secp256r1', tunnel_type: 'masque' };
+            if (name) enrollment.name = name;
+
+            let enrolled;
+            try {
+                enrolled = await warpRequest(`/reg/${registration.id}`, {
+                    method: 'PATCH',
+                    token: registration.token,
+                    api: MASQUE_API,
+                    clientVersion: MASQUE_CLIENT_VERSION,
+                    body: enrollment
+                });
+            } catch (err) {
+                throw new Error(`MASQUE key enrollment failed: ${err.message}`);
+            }
+
+            return { warpResponse: { ...registration, ...enrolled }, privateKey: keypair.privateKey };
+        }
+
+        async function applyLicense(device, license, api = WARP_API) {
             let account;
             try {
                 account = await warpRequest(`/reg/${device.id}/account`, {
                     method: 'PUT',
                     token: device.token,
-                    body: { license }
+                    body: { license },
+                    api
                 });
             } catch (err) {
                 throw new Error(`License activation failed: ${err.message}`);
@@ -381,7 +544,7 @@
 
             try {
                 // re-read the device so the config and account info reflect the licensed account
-                const refreshed = await warpRequest(`/reg/${device.id}`, { token: device.token });
+                const refreshed = await warpRequest(`/reg/${device.id}`, { token: device.token, api });
                 return { ...device, ...refreshed };
             } catch (err) {
                 // the license is bound; fall back to the account returned by the update
@@ -416,16 +579,34 @@ Endpoint = ${endpoint}`;
 
         // Stash and other userspace clients can send the reserved bytes, which the official
         // WireGuard apps cannot, so this profile is the stable way to use WARP as a proxy.
-        function generateStashConfig(privateKey, warpResponse, options) {
+        function warpProxyLines(privateKey, warpResponse, options) {
             const peer = warpResponse.config.peers[0];
             const iface = warpResponse.config.interface;
-            const { ip, port } = endpointParts(warpResponse);
             const dns = options.dns.split(',').map(entry => entry.trim()).filter(Boolean);
+
+            if (device.protocol === 'masque') {
+                const { ip, port } = masqueEndpointParts(warpResponse);
+                return [
+                    `  - name: WARP`,
+                    `    type: masque`,
+                    `    server: ${ip}`,
+                    `    port: ${port}`,
+                    `    private-key: ${privateKey}`,
+                    `    public-key: ${stripPem(peer.public_key)}`,
+                    `    ip: ${iface.addresses.v4}/32`,
+                    `    ipv6: '${iface.addresses.v6}/128'`,
+                    `    mtu: ${options.mtu}`,
+                    `    keepalive: 30`,
+                    `    dns: [${dns.map(entry => `'${entry}'`).join(', ')}]`
+                ];
+            }
+
+            const { ip, port } = endpointParts(warpResponse);
             const keepalive = options.keepalive && options.keepalive !== '0'
                 ? [`    keepalive: ${options.keepalive}`]
                 : [];
 
-            const proxy = [
+            return [
                 `  - name: WARP`,
                 `    type: wireguard`,
                 `    server: ${ip}`,
@@ -441,16 +622,25 @@ Endpoint = ${endpoint}`;
                 `    dns:`,
                 ...dns.map(entry => `      - ${entry}`)
             ];
+        }
 
-            return `# Cloudflare WARP profile for Stash / Clash.
-# reserved carries Cloudflare's client_id: without it WARP cannot keep routing
+        function protocolNotes() {
+            return device.protocol === 'masque'
+                ? `# MASQUE (CONNECT-IP over HTTP/3) on port ${masqueEndpointParts(device.warpResponse).port},
+# the protocol the official WARP client uses. Requires Stash 3.6+ / macOS 4.3+.`
+                : `# reserved carries Cloudflare's client_id: without it WARP cannot keep routing
 # your packets to the same server and the tunnel stalls after a while.
+# On mihomo / Clash.Meta, rename keepalive to persistent-keepalive.`;
+        }
+
+        function generateClashProfile(privateKey, warpResponse, options) {
+            return `# Cloudflare WARP profile for Stash / Clash.
+${protocolNotes()}
 # To chain WARP behind another proxy, uncomment dialer-proxy below.
-# On mihomo / Clash.Meta, rename keepalive to persistent-keepalive.
 mixed-port: 7890
 mode: rule
 proxies:
-${proxy.join('\n')}
+${warpProxyLines(privateKey, warpResponse, options).join('\n')}
     # dialer-proxy: My Other Proxy
 proxy-groups:
   - name: PROXY
@@ -463,21 +653,44 @@ rules:
 `;
         }
 
+        // An override merges into the profile already loaded in Stash: arrays from the
+        // override are inserted ahead of the originals, so this adds the node in place.
+        function generateStashOverride(privateKey, warpResponse, options) {
+            return `name: Cloudflare WARP
+desc: |-
+  Adds a "WARP" ${device.protocol === 'masque' ? 'MASQUE' : 'WireGuard'} proxy to the profile that is already loaded.
+  Reference it from a proxy group or rule, and set dialer-proxy to chain it behind another proxy.
+  Device ${warpResponse.id || '-'}, generated ${new Date().toISOString().slice(0, 10)}.
+${protocolNotes()}
+proxies:
+${warpProxyLines(privateKey, warpResponse, options).join('\n')}
+    # dialer-proxy: My Other Proxy
+`;
+        }
+
         function outputs() {
             const { privateKey, warpResponse, options } = device;
-            if (outputFormat === 'stash') {
-                const config = generateStashConfig(privateKey, warpResponse, options);
-                const dataUrl = `data:text/yaml;base64,${base64(config)}`;
+
+            if (outputFormat === 'clash') {
                 return {
-                    config,
+                    config: generateClashProfile(privateKey, warpResponse, options),
                     filename: 'warp.yaml',
                     mime: 'text/yaml',
-                    label: 'Stash / Clash Profile',
-                    qr: `stash://install-config?url=${encodeURIComponent(dataUrl)}`,
-                    qrOptions: { width: 320, errorCorrectionLevel: 'L' },
-                    qrLabel: 'Scan in Stash: Settings → Profiles → Scan QRcode. If Stash rejects it, download the YAML and open it with Stash instead.'
+                    label: 'Clash / Stash Profile',
+                    hint: 'A standalone profile. On iOS, download it and open it with Stash (Settings → Profiles → import from file), or AirDrop it to the phone. Stash can only scan QR codes that contain a URL to a hosted config, so there is nothing useful to scan here.'
                 };
             }
+
+            if (outputFormat === 'override') {
+                return {
+                    config: generateStashOverride(privateKey, warpResponse, options),
+                    filename: 'warp.stoverride',
+                    mime: 'text/yaml',
+                    label: 'Stash Override',
+                    hint: 'Adds the WARP proxy to the profile you already use, instead of replacing it. Download it, then open it with Stash (Stash 3.1.1+ imports .stoverride files directly). If you host it yourself, stash://install-override?url=… installs it in one tap.'
+                };
+            }
+
             const config = generateConfig(privateKey, warpResponse, options);
             return {
                 config,
@@ -494,9 +707,31 @@ rules:
             const output = outputs();
             configOutput.value = output.config;
             configLabel.textContent = output.label;
-            qrLabel.textContent = output.qrLabel;
             downloadBtn.textContent = `Download ${output.filename}`;
-            await generateQRCode(output.qr, output.qrOptions);
+
+            qrSection.classList.toggle('hidden', !output.qr);
+            importHint.classList.toggle('hidden', !output.hint);
+            importHint.textContent = output.hint || '';
+
+            if (output.qr) {
+                qrLabel.textContent = output.qrLabel;
+                await generateQRCode(output.qr, output.qrOptions);
+            } else {
+                qrCodeDiv.innerHTML = '';
+            }
+        }
+
+        // A MASQUE device has no WireGuard config to hand to the official clients.
+        function applyProtocolToFormats(protocol) {
+            const wireguardOnly = formatToggle.querySelector('button[data-format="wireguard"]');
+            wireguardOnly.classList.toggle('hidden', protocol === 'masque');
+
+            if (protocol === 'masque' && outputFormat === 'wireguard') {
+                outputFormat = 'clash';
+            }
+            for (const option of formatToggle.querySelectorAll('button[data-format]')) {
+                option.setAttribute('aria-pressed', String(option.dataset.format === outputFormat));
+            }
         }
 
         generateBtn.addEventListener('click', async () => {
@@ -506,21 +741,35 @@ rules:
             generateBtn.textContent = 'Generating...';
 
             try {
-                // Generate WireGuard keypair
-                const keypair = window.wireguard.generateKeypair();
                 const options = getOptions();
                 const license = licenseKeyInput.value.trim();
+                const name = deviceNameInput.value.trim();
+                const protocol = protocolChoice.querySelector('input[name="protocol"]:checked').value;
 
-                // Register with Cloudflare WARP
-                let warpResponse = await registerWithWarp(keypair.publicKey, options);
+                let warpResponse;
+                let privateKey;
+
+                if (protocol === 'masque') {
+                    const enrolled = await registerMasque(options, name);
+                    warpResponse = enrolled.warpResponse;
+                    privateKey = enrolled.privateKey;
+                } else {
+                    const keypair = window.wireguard.generateKeypair();
+                    privateKey = keypair.privateKey;
+                    warpResponse = await registerWithWarp(keypair.publicKey, options);
+                    if (name) {
+                        warpResponse = { ...warpResponse, ...await setDeviceName(warpResponse, name) };
+                    }
+                }
 
                 // Attach the WARP+ license to the new device, if one was provided
                 if (license) {
-                    warpResponse = await applyLicense(warpResponse, license);
+                    const api = protocol === 'masque' ? MASQUE_API : WARP_API;
+                    warpResponse = await applyLicense(warpResponse, license, api);
                 }
 
-                // Generate config
-                device = { privateKey: keypair.privateKey, warpResponse, options };
+                device = { privateKey, warpResponse, options, protocol };
+                applyProtocolToFormats(protocol);
 
                 // Display account info
                 displayAccountInfo(warpResponse);
